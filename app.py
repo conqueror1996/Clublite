@@ -171,7 +171,7 @@ def get_http_session():
     return sess
 
 
-def current_egress(timeout=(2, 4)):
+def current_egress(timeout=(5, 10)):
     """Best-effort exit-IP lookup for THIS thread's active session (the
     same sticky residential exit the gateway traffic uses). Returns a
     short human-readable string or None; never blocks a run for long."""
