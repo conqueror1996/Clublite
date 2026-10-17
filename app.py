@@ -33,7 +33,7 @@ PANEL_HOST = "https://wbpay888.wbpay888.net"
 API_HOST = "https://wbpay888api.wbpay888.net"
 HOSTS = [PANEL_HOST, API_HOST]
 MERCHANT_ID = int(os.environ.get("WB_MERCHANT_ID", "32"))
-MERCHANT_SECRET = os.environ.get("WB_MERCHANT_SECRET", "")  # set in host env, never commit
+MERCHANT_SECRET = os.environ.get("WB_MERCHANT_SECRET") or os.environ.get("MERCHANT_SECRET", "")  # set in host env, never commit
 CONNECT_TIMEOUT = 3
 READ_TIMEOUT = 8
 HTTP_RETRIES = 1
@@ -97,7 +97,7 @@ def _req(method, path, body=None, retries=HTTP_RETRIES, hosts=None):
                     headers=_headers(),
                 )
                 data, err = _parse_body(r)
-                attempts.append({"host": host, "attempt": attempt, "http": r.status_code})
+                attempts.append({"host": host, "attempt": attempt, "http": r.status_code, "path": path})
                 if data is not None:
                     return attempts, data, None
                 last_err = err or f"HTTP {r.status_code}"
@@ -105,11 +105,31 @@ def _req(method, path, body=None, retries=HTTP_RETRIES, hosts=None):
                     break
             except requests.exceptions.Timeout as e:
                 last_err = f"Timeout: {e}"
-                attempts.append({"host": host, "attempt": attempt, "error": last_err})
+                attempts.append({"host": host, "attempt": attempt, "error": last_err, "path": path})
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
-                attempts.append({"host": host, "attempt": attempt, "error": last_err})
+                attempts.append({"host": host, "attempt": attempt, "error": last_err, "path": path})
     return attempts, None, last_err
+
+
+# ELB now 403s the literal /v1.0/api/order;/... paths. Double-slash still
+# reaches origin: /v1.0/api//order;/action
+ORDER_PREFIXES = [
+    "/v1.0/api//order;",
+    "/v1.0/api//order",
+    "/v1.0/api/order;",
+    "/v1.0/api/order",
+]
+
+
+def order_post(action, body, hosts=None):
+    last = ([], None, "no path tried")
+    for prefix in ORDER_PREFIXES:
+        attempts, data, err = _req("POST", f"{prefix}/{action}", body, hosts=hosts or [PANEL_HOST])
+        last = (attempts, data, err)
+        if data is not None:
+            return attempts, data, None
+    return last
 
 
 def api_get(path, retries=HTTP_RETRIES, hosts=None):
@@ -196,24 +216,15 @@ def extract_rows(data):
 
 
 def lookup_order(order_code):
-    _a, data, _err = api_post(
-        "/v1.0/api/order/callback", {"orderCode": order_code},
-        hosts=[PANEL_HOST],
-    )
-    if ok(data) and isinstance(data.get("data"), dict):
-        return data["data"]
-    _a, data, _err = api_post(
-        "/v1.0/api/order;/callback", {"orderCode": order_code},
-        hosts=[PANEL_HOST],
-    )
+    _a, data, _err = order_post("callback", {"orderCode": order_code}, hosts=[PANEL_HOST])
     if ok(data) and isinstance(data.get("data"), dict):
         return data["data"]
     return None
 
 
 def fetch_recent_orders(page_size=200):
-    _a, data, err = api_post(
-        "/v1.0/api/order;/queryPage",
+    _a, data, err = order_post(
+        "queryPage",
         {"mchId": MERCHANT_ID, "pageSize": page_size, "pageNum": 1},
         hosts=[PANEL_HOST],
     )
@@ -285,11 +296,13 @@ def update_order_status(order, status=1):
         payloads.append({"id": order_id, "orderCode": order_code, "status": status})
     last = None
     for body in payloads:
-        _a, data, err = api_post(
-            "/v1.0/api/order;/updateOrderStatus", body, hosts=[PANEL_HOST],
-        )
+        _a, data, err = order_post("updateOrderStatus", body, hosts=[PANEL_HOST])
         last = (body, data, err)
         if ok(data):
+            return body, data, None
+        msg = (data or {}).get("msg") or ""
+        # already paid / locked as completed — treat as success
+        if data and ("已完成" in str(msg) or "不允许修改" in str(msg)):
             return body, data, None
         if data and data.get("msg"):
             last = (body, data, data.get("msg"))
@@ -317,9 +330,7 @@ def trigger_callbacks(order):
     for action, body in bodies + extra_paths:
         if not body.get("orderCode") and body.get("orderId") is None:
             continue
-        _a, data, err = api_post(
-            f"/v1.0/api/order;/{action}", body, hosts=[PANEL_HOST],
-        )
+        _a, data, err = order_post(action, body, hosts=[PANEL_HOST])
         snippet = None
         if isinstance(data, dict):
             snippet = {
