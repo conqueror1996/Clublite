@@ -85,29 +85,62 @@ def _sec_headers(ua):
 # originate from a real Indian ISP IP (Jio/Airtel/BSNL-style), not a
 # datacenter/Render IP. Format (env var, never committed):
 #   WB_PROXY_URL=http://user:pass_country-in_session-<id>_lifetime-168h@geo.iproyal.com:12321
-# WB_PROXY_ROTATE=1 swaps the sticky session id for every confirmation
-# run: each order is confirmed from a different (still Indian, still
-# sticky-within-the-run) residential IP, like distinct customers.
+# WB_PROXY_ROTATE=1 gives every confirmation run a fresh sticky session id
+# AND a randomly targeted Indian city, so each order is confirmed from a
+# different city's residential ISP (like distinct customers nationwide),
+# while staying sticky on one IP for that entire order's pipeline.
 PROXY_URL = os.environ.get("WB_PROXY_URL", "")
 PROXY_ROTATE = os.environ.get("WB_PROXY_ROTATE", "") == "1"
+
+# Indian metro pool for per-confirmation location rotation (verified live:
+# city targeting steers the exit - Mumbai->Jio Maharashtra, Kolkata->Hathway
+# West Bengal. Region targeting is IGNORED by the proxy, so city is used.
+# Plain session-id rotation alone was insufficient - fresh ids collapsed
+# onto the same Delhi exit, so city targeting is what actually moves us.)
+_ROTATE_CITIES = [
+    "mumbai", "kolkata", "chennai", "bangalore", "hyderabad", "pune",
+    "delhi", "jaipur", "lucknow", "ahmedabad", "surat", "indore",
+    "patna", "nagpur", "kanpur",
+]
+
+
+def _strip_city(url):
+    """Drop any _city-<x> target from a proxy credential URL."""
+    if "_city-" in url:
+        # single pass: works with city at the end of the credential string
+        # and when other params (_session-, _lifetime-) follow the city
+        url = re.sub(r"_city-[A-Za-z0-9]+", "", url)
+    return url
 
 
 def _proxy_url_for_session():
     """Proxy URL for a newly created HTTP session.
 
-    In rotate mode the sticky session token inside the credentials is
-    replaced with a fresh random id, which binds a new residential exit
-    IP (verified live: Jio Haryana vs Kerala Vision on swapped ids).
-    Without rotate mode every session reuses the configured sticky id."""
+    In rotate mode each confirmation gets: a fresh sticky session id AND a
+    randomly chosen Indian city target, so every order is confirmed from a
+    different city's residential ISP. If the thread hit proxy trouble with
+    a city-targeted exit (no_city flag, set by _req's fallback), the city
+    target is dropped and any-India sticky exit is used instead so a run
+    never dies on proxy throttling. Without rotate mode the configured
+    sticky id is reused as-is."""
     if not PROXY_URL:
         return ""
     if not PROXY_ROTATE:
         return PROXY_URL
     sid = uuid.uuid4().hex[:10]
     if "_session-" in PROXY_URL:
-        return re.sub(r"_session-[A-Za-z0-9]+", f"_session-{sid}", PROXY_URL)
-    # no session token present: append one to the password portion
-    return re.sub(r"(:[^@]*)@", r"\1_session-" + sid + "@", PROXY_URL, count=1)
+        url = re.sub(r"_session-[A-Za-z0-9]+", f"_session-{sid}", PROXY_URL)
+    else:
+        # no session token present: append one to the password portion
+        url = re.sub(r"(:[^@]*)@", r"\1_session-" + sid + "@", PROXY_URL, count=1)
+    if getattr(_session_local, "no_city", False):
+        return _strip_city(url)
+    city = _random.choice(_ROTATE_CITIES)
+    if "_city-" in url:
+        url = re.sub(r"_city-[A-Za-z0-9]+", f"_city-{city}", url)
+    elif "_country-" in url:
+        url = re.sub(r"(_country-[a-z-]+)", r"\1_city-" + city, url, count=1)
+    return url
 
 
 # Thread-local session cache: one requests.Session per engine thread so
@@ -130,11 +163,28 @@ def get_http_session():
         proxy = _proxy_url_for_session()
         if proxy:
             sess.proxies = {"http": proxy, "https": proxy}
+        sess._proxy = proxy  # remembered for egress logging + _req fallback
         sess._ua = _rand_ua()  # one UA per browsing session, not per request
         sess.headers.update(_sec_headers(sess._ua))
         _session_local.sess = sess
         _session_local.born = now
     return sess
+
+
+def current_egress(timeout=(2, 4)):
+    """Best-effort exit-IP lookup for THIS thread's active session (the
+    same sticky residential exit the gateway traffic uses). Returns a
+    short human-readable string or None; never blocks a run for long."""
+    sess = getattr(_session_local, "sess", None)
+    if sess is None or not getattr(sess, "_proxy", ""):
+        return None
+    try:
+        r = requests.get("https://ipinfo.io/json", proxies=sess.proxies,
+                         timeout=timeout, verify=False)
+        d = r.json()
+        return f"{d.get('ip')} ({d.get('city')}, {d.get('org')})"
+    except Exception:
+        return None
 
 
 def rotate_thread_session():
@@ -148,6 +198,7 @@ def rotate_thread_session():
         pass
     _session_local.sess = None
     _session_local.born = 0
+    _session_local.no_city = False  # new run: re-enable city rotation
 
 
 def check_egress():
@@ -247,6 +298,36 @@ def _req(method, path, body=None, retries=HTTP_RETRIES, hosts=None):
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
                 attempts.append({"host": host, "attempt": attempt, "error": last_err, "path": path})
+    # Fallback: if this run's city-targeted residential exit is unavailable
+    # or throttled (proxy conn errors / empty responses), rebuild the thread
+    # session on an any-India sticky exit and try once more before failing.
+    if (
+        last_err
+        and PROXY_URL
+        and PROXY_ROTATE
+        and not getattr(_session_local, "no_city", False)
+        and "_city-" in (getattr(sess, "_proxy", "") or "")
+    ):
+        _session_local.no_city = True
+        rotate_thread_session()
+        sess = get_http_session()
+        hdrs = _headers(getattr(sess, "_ua", None) or UA)
+        sess.headers.update(hdrs)
+        for host in (hosts or HOSTS):
+            try:
+                r = sess.request(
+                    method, host + path, json=body,
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                    verify=False, headers=hdrs,
+                )
+                data, err = _parse_body(r)
+                attempts.append({"host": host, "attempt": "fallback-nocity", "http": r.status_code, "path": path})
+                if data is not None:
+                    return attempts, data, None
+                last_err = err or f"HTTP {r.status_code}"
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                attempts.append({"host": host, "attempt": "fallback-nocity", "error": last_err, "path": path})
     return attempts, None, last_err
 
 
@@ -747,13 +828,18 @@ def run_confirmation_events(user_input, forced_utr=None):
         # sticky for the whole run (warmup, resolve, UTR submit, verify)
         rotate_thread_session()
     _warmup()
+    # record the exact residential exit this confirmation runs from (the
+    # same sticky session the gateway traffic uses) for the run log
+    run_egress = current_egress() if PROXY_URL else None
+    if run_egress:
+        log(f"confirm egress: {run_egress}")
     # TCP slow-start: real browsers don't fire API calls immediately
     natural_delay(0.6, 1.4)
     result = {
         "ok": False, "orderCode": None, "amount": None, "status": None,
         "orderStatus": None, "sign": None, "steps": [], "error": None,
         "elapsed": None, "verified": False, "completedTime": None,
-        "walletHint": None,
+        "walletHint": None, "egress": run_egress,
     }
 
     def emit(step=None, **extra):
@@ -1086,6 +1172,7 @@ function render(j){
   if(j.status) m.push(`Gateway <b>${esc(j.status)}</b>`);
   if(j.orderStatus) m.push(`Cashier <b>${esc(j.orderStatus)}</b>`);
   if(j.completedTime) m.push(`Completed <b>${esc(j.completedTime)}</b>`);
+  if(j.egress) m.push(`Egress <b>${esc(j.egress)}</b>`);
   if(j.sign) m.push(`Sign <b>${esc(j.sign).slice(0,8)}…</b>`);
   if(j.elapsed!=null) m.push(`<b>${esc(j.elapsed)}s</b>`);
   $('meta').innerHTML = m.join('');
