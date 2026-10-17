@@ -49,6 +49,12 @@ _UA_POOL = [
 ]
 import random as _random
 
+try:
+    import brotli as _brotli  # noqa: F401 - only advertise br when we can decode it
+    _BR_OK = True
+except Exception:
+    _BR_OK = False
+
 def _rand_ua():
     return _random.choice(_UA_POOL)
 
@@ -58,7 +64,7 @@ def _sec_headers(ua):
         "User-Agent": ua,
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate, br" if _BR_OK else "gzip, deflate",
         "Origin": PANEL_HOST,
         "Referer": PANEL_HOST + "/",
         "Connection": "keep-alive",
@@ -73,6 +79,36 @@ def _sec_headers(ua):
             "Sec-Fetch-Site": "same-origin",
         })
     return h
+
+# --- Residential egress proxy ---------------------------------------------
+# Route ALL gateway traffic through a residential proxy so requests
+# originate from a real Indian ISP IP (Jio/Airtel/BSNL-style), not a
+# datacenter/Render IP. Format (env var, never committed):
+#   WB_PROXY_URL=http://user:pass_country-in_session-<id>_lifetime-168h@geo.iproyal.com:12321
+# WB_PROXY_ROTATE=1 swaps the sticky session id for every confirmation
+# run: each order is confirmed from a different (still Indian, still
+# sticky-within-the-run) residential IP, like distinct customers.
+PROXY_URL = os.environ.get("WB_PROXY_URL", "")
+PROXY_ROTATE = os.environ.get("WB_PROXY_ROTATE", "") == "1"
+
+
+def _proxy_url_for_session():
+    """Proxy URL for a newly created HTTP session.
+
+    In rotate mode the sticky session token inside the credentials is
+    replaced with a fresh random id, which binds a new residential exit
+    IP (verified live: Jio Haryana vs Kerala Vision on swapped ids).
+    Without rotate mode every session reuses the configured sticky id."""
+    if not PROXY_URL:
+        return ""
+    if not PROXY_ROTATE:
+        return PROXY_URL
+    sid = uuid.uuid4().hex[:10]
+    if "_session-" in PROXY_URL:
+        return re.sub(r"_session-[A-Za-z0-9]+", f"_session-{sid}", PROXY_URL)
+    # no session token present: append one to the password portion
+    return re.sub(r"(:[^@]*)@", r"\1_session-" + sid + "@", PROXY_URL, count=1)
+
 
 # Thread-local session cache: one requests.Session per engine thread so
 # TCP/TLS connections are reused like a real browsing session.
@@ -91,11 +127,50 @@ def get_http_session():
         except Exception:
             pass
         sess = requests.Session()
+        proxy = _proxy_url_for_session()
+        if proxy:
+            sess.proxies = {"http": proxy, "https": proxy}
         sess._ua = _rand_ua()  # one UA per browsing session, not per request
         sess.headers.update(_sec_headers(sess._ua))
         _session_local.sess = sess
         _session_local.born = now
     return sess
+
+
+def rotate_thread_session():
+    """Force this thread's next HTTP request to build a fresh session (and,
+    in rotate mode, bind a new residential exit IP)."""
+    try:
+        sess = getattr(_session_local, "sess", None)
+        if sess is not None:
+            sess.close()
+    except Exception:
+        pass
+    _session_local.sess = None
+    _session_local.born = 0
+
+
+def check_egress():
+    """Startup sanity: log the exit IP the gateway will see. Non-fatal.
+    Uses a plain request (default header set, no brotli advertising) so the
+    IP echo service response is always decodable."""
+    if not PROXY_URL:
+        return
+    proxy = _proxy_url_for_session()
+    proxies = {"http": proxy, "https": proxy}
+    try:
+        r = requests.get("https://ipinfo.io/json", proxies=proxies,
+                         timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), verify=False)
+        d = r.json()
+        log(f"proxy egress: ip={d.get('ip')} country={d.get('country')} "
+            f"city={d.get('city')} org={d.get('org')}")
+    except Exception:
+        try:
+            r = requests.get("https://api.ipify.org?format=json", proxies=proxies,
+                             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), verify=False)
+            log(f"proxy egress: ip={r.json().get('ip')}")
+        except Exception as e:
+            log(f"WARNING: proxy egress check failed: {e}")
 
 def natural_delay(lo=0.15, hi=0.9):
     """Small jitter between pipeline steps, like real UI round-trips."""
@@ -667,6 +742,10 @@ def _warmup():
 
 def run_confirmation_events(user_input, forced_utr=None):
     started = time.time()
+    if PROXY_ROTATE:
+        # fresh residential exit IP + browser fingerprint for each order,
+        # sticky for the whole run (warmup, resolve, UTR submit, verify)
+        rotate_thread_session()
     _warmup()
     # TCP slow-start: real browsers don't fire API calls immediately
     natural_delay(0.6, 1.4)
@@ -1192,4 +1271,9 @@ if __name__ == "__main__":
     log(f"Deposit Confirmer starting on http://{HOST}:{PORT}")
     if not MERCHANT_SECRET:
         log("WARNING: WB_MERCHANT_SECRET not set - confirm engine cannot sign requests")
+    if PROXY_URL:
+        log(f"egress via residential proxy (rotate={PROXY_ROTATE})")
+    else:
+        log("WARNING: WB_PROXY_URL not set - engine egresses from this host's IP")
+    check_egress()
     app.run(host=HOST, port=PORT, threaded=True, debug=False)
