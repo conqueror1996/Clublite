@@ -522,7 +522,8 @@ def _warmup():
 def run_confirmation_events(user_input):
     started = time.time()
     _warmup()
-    natural_delay(0.3, 1.2)
+    # TCP slow-start: real browsers don't fire API calls immediately
+    natural_delay(0.6, 1.4)
     result = {
         "ok": False, "orderCode": None, "amount": None, "status": None,
         "orderStatus": None, "sign": None, "steps": [], "error": None,
